@@ -203,12 +203,19 @@ app default {
 	}
 
 	card_driver edo {
-		# CAN is required to establish connection
-		# with the card. It might be overridden by
-		# EDO_CAN environment variable. Currently,
-		# it is not possible to set it in any other way.
+		# CAN prompting policy:
+		# always  - ask at the start of each card connection (default)
+		# never   - use an available CAN; ask if missing or invalid
+		# confirm - confirm an available CAN, or enter another one
+		# can_prompt = always;
 		#
-		#can = 123456;
+		# Existing CAN sources remain supported. A nonempty EDO_CAN
+		# environment variable takes precedence over "can".
+		# To use these sources without a dialog, set can_prompt = never.
+		# can = 123456;
+		#
+		# An accepted CAN is kept only for the lifetime of the connection.
+		# This driver does not persist an interactively entered CAN.
 	}
 
 	card_driver eoi {

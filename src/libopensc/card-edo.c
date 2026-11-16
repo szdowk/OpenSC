@@ -31,6 +31,14 @@
 #include "sm/sm-eac.h"
 #include <string.h>
 #include <stdlib.h>
+#include "card-edo-pinentry.h"
+
+
+struct edo_private {
+	char can[7];
+	/* Only an available CAN may trigger a manual recovery prompt. */
+	int entered;
+};
 
 
 static struct sc_card_operations edo_ops;
@@ -75,7 +83,7 @@ static int edo_match_card(sc_card_t* card) {
 }
 
 
-static int edo_get_can(sc_card_t* card, struct establish_pace_channel_input* pace_input) {
+static int edo_get_configured_can(sc_card_t* card, struct establish_pace_channel_input* pace_input) {
 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
 	const char* can;
 
@@ -107,34 +115,176 @@ static int edo_get_can(sc_card_t* card, struct establish_pace_channel_input* pac
 }
 
 
-static int edo_unlock(sc_card_t* card) {
-	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+static const char *edo_can_prompt_mode(sc_card_t *card)
+{
+	const char *mode = "always";
+	size_t i, j;
 
-	struct establish_pace_channel_input pace_input;
-	struct establish_pace_channel_output pace_output;
+	for (i = 0; card->ctx->conf_blocks[i]; ++i) {
+		scconf_block **blocks = scconf_find_blocks(card->ctx->conf,
+			card->ctx->conf_blocks[i], "card_driver", "edo");
+		if (!blocks)
+			continue;
+		for (j = 0; blocks[j]; ++j)
+			mode = scconf_get_str(blocks[j], "can_prompt", mode);
+		free(blocks);
+	}
+	return mode;
+}
+
+static int edo_can_valid(const unsigned char *can, size_t length)
+{
+	size_t i;
+
+	if (!can || length != 6)
+		return 0;
+	for (i = 0; i < length; ++i)
+		if (can[i] < '0' || can[i] > '9')
+			return 0;
+	return 1;
+}
+
+static int edo_prepare_can(sc_card_t *card, struct edo_private *priv)
+{
+	struct establish_pace_channel_input configured;
+	const char *mode = edo_can_prompt_mode(card);
 	int r;
 
-	memset(&pace_input, 0, sizeof pace_input);
-	memset(&pace_output, 0, sizeof pace_output);
-
-	if (SC_SUCCESS != edo_get_can(card, &pace_input)) {
-		sc_log(card->ctx, "Error reading CAN.");
-		LOG_FUNC_RETURN(card->ctx, SC_ERROR_UNKNOWN);
+	if (strcmp(mode, "always") && strcmp(mode, "never")
+			&& strcmp(mode, "confirm")) {
+		sc_log(card->ctx, "Invalid edo can_prompt setting.");
+		return SC_ERROR_INVALID_ARGUMENTS;
 	}
 
-	r = perform_pace(card, pace_input, &pace_output, EAC_TR_VERSION_2_02);
-	/* These caller-owned outputs may also be allocated on failure. */
-	free(pace_output.ef_cardaccess);
-	free(pace_output.recent_car);
-	free(pace_output.previous_car);
-	free(pace_output.id_icc);
-	free(pace_output.id_pcd);
+	/* Reuse a decision only within this card connection. */
+	if (edo_can_valid((const unsigned char *)priv->can, 6))
+		return SC_SUCCESS;
+	sc_mem_clear(priv->can, sizeof(priv->can));
+	priv->entered = 0;
+
+	if (strcmp(mode, "always")) {
+		memset(&configured, 0, sizeof(configured));
+		r = edo_get_configured_can(card, &configured);
+		if (r == SC_SUCCESS &&
+				edo_can_valid(configured.pin, configured.pin_length)) {
+			if (!strcmp(mode, "never")) {
+				memcpy(priv->can, configured.pin, 6);
+				return SC_SUCCESS;
+			}
+			r = edo_pinentry_request(card,
+				"Czy użyć dostępnego CAN z dowodu osobistego?",
+				"Użyj zapisanego", "Wpisz inny", NULL);
+			if (r == SC_SUCCESS) {
+				memcpy(priv->can, configured.pin, 6);
+				return SC_SUCCESS;
+			}
+			if (r != SC_ERROR_NOT_ALLOWED)
+				return r;
+		}
+	}
+
+	r = edo_pinentry_request(card,
+		"Wpisz 6-cyfrowy CAN z dowodu osobistego. "
+		"CAN jest numerem nadrukowanym na dokumencie, "
+		"a nie kodem PIN1 ani PIN2.",
+		"Dalej", NULL, priv->can);
+	if (r == SC_SUCCESS)
+		priv->entered = 1;
+	return r;
+}
+
+static int edo_pace_once(sc_card_t *card, const char can[7])
+{
+	struct establish_pace_channel_input input;
+	struct establish_pace_channel_output output;
+	int r;
+
+	memset(&input, 0, sizeof(input));
+	memset(&output, 0, sizeof(output));
+	input.pin_id = PACE_PIN_ID_CAN;
+	input.pin = (const unsigned char *)can;
+	input.pin_length = 6;
+
+	r = perform_pace(card, input, &output, EAC_TR_VERSION_2_02);
+	/* Each attempt owns its outputs, including partial failure output. */
+	free(output.ef_cardaccess);
+	free(output.recent_car);
+	free(output.previous_car);
+	free(output.id_icc);
+	free(output.id_pcd);
+	return r;
+}
+
+static int edo_can_offer_recovery(sc_card_t *card,
+		const struct edo_private *priv, int result)
+{
+	if (priv->entered ||
+			(card->ctx->flags & SC_CTX_FLAG_DISABLE_POPUPS))
+		return 0;
+
+	/*
+	 * These errors can include an unsuitable CAN, but do not prove it.
+	 * Only offer manual input; never retry an available CAN automatically.
+	 */
+	switch (result) {
+	case SC_ERROR_PIN_CODE_INCORRECT:
+	case SC_ERROR_SECURITY_STATUS_NOT_SATISFIED:
+	case SC_ERROR_CARD_CMD_FAILED:
+	case SC_ERROR_INTERNAL:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int edo_unlock(sc_card_t *card)
+{
+	struct edo_private *priv = card->drv_data;
+	int r;
+
+	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+	if (!priv)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INTERNAL);
+
+	r = edo_prepare_can(card, priv);
 	if (r != SC_SUCCESS) {
-		sc_log(card->ctx, "Error verifying CAN.");
-		LOG_FUNC_RETURN(card->ctx, SC_ERROR_UNKNOWN);
+		sc_mem_clear(priv->can, sizeof(priv->can));
+		LOG_FUNC_RETURN(card->ctx, r);
 	}
 
-	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
+	r = edo_pace_once(card, priv->can);
+	if (r != SC_SUCCESS && edo_can_offer_recovery(card, priv, r)) {
+		sc_mem_clear(priv->can, sizeof(priv->can));
+		r = edo_pinentry_request(card,
+			"Nie udało się połączyć z dowodem przy użyciu "
+			"dostępnego CAN. Możesz wpisać CAN nadrukowany "
+			"na przyłożonym dowodzie i spróbować ponownie "
+			"albo wybrać Anuluj.",
+			"Połącz", NULL, priv->can);
+		if (r == SC_SUCCESS) {
+			priv->entered = 1;
+			r = sc_sm_stop(card);
+			if (r == SC_SUCCESS)
+				r = edo_pace_once(card, priv->can);
+		}
+	}
+	if (r != SC_SUCCESS) {
+		sc_mem_clear(priv->can, sizeof(priv->can));
+		sc_log(card->ctx, "Error establishing PACE with CAN.");
+	}
+	LOG_FUNC_RETURN(card->ctx, r);
+}
+
+static int edo_finish(sc_card_t *card)
+{
+	struct edo_private *priv = card->drv_data;
+
+	if (priv) {
+		sc_mem_clear(priv, sizeof(*priv));
+		free(priv);
+		card->drv_data = NULL;
+	}
+	return SC_SUCCESS;
 }
 
 
@@ -339,6 +489,7 @@ static int edo_set_security_env(struct sc_card* card, const struct sc_security_e
  * PACE channel have to be established.
  */
 static int edo_init(sc_card_t* card) {
+	int r;
 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
 
 	memset(&card->sm_ctx, 0, sizeof card->sm_ctx);
@@ -356,7 +507,15 @@ static int edo_init(sc_card_t* card) {
 
 	LOG_TEST_RET(card->ctx, sc_enum_apps(card), "Enumerate apps failed");
 
-	LOG_TEST_RET(card->ctx, edo_unlock(card), "Unlock card failed");
+	card->drv_data = calloc(1, sizeof(struct edo_private));
+	if (!card->drv_data)
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
+
+	r = edo_unlock(card);
+	if (r != SC_SUCCESS) {
+		edo_finish(card);
+		LOG_FUNC_RETURN(card->ctx, r);
+	}
 
 	LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 }
@@ -372,6 +531,7 @@ struct sc_card_driver* sc_get_edo_driver(void) {
 	edo_ops = *sc_get_iso7816_driver()->ops;
 	edo_ops.match_card = edo_match_card;
 	edo_ops.init = edo_init;
+	edo_ops.finish = edo_finish;
 	edo_ops.select_file = edo_select_file;
 	edo_ops.set_security_env = edo_set_security_env;
 	edo_ops.compute_signature = edo_compute_signature;
