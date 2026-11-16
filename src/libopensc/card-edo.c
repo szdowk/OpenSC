@@ -31,12 +31,16 @@
 #include <string.h>
 #include <stdlib.h>
 #include "card-edo-pinentry.h"
+#include "card-edo-can-store.h"
 
 
 struct edo_private {
 	char can[7];
 	/* Only an available CAN may trigger a manual recovery prompt. */
 	int entered;
+	int save_ask;
+	int storage_allowed;
+	int save_offered;
 };
 
 
@@ -143,10 +147,64 @@ static int edo_can_valid(const unsigned char *can, size_t length)
 	return 1;
 }
 
-static int edo_prepare_can(sc_card_t *card, struct edo_private *priv)
+static int edo_can_storage_policy(sc_card_t *card,
+		int *ask, int *allowed)
+{
+	const char *save = "no";
+	size_t i, j;
+
+	*ask = 0;
+	*allowed = 1;
+	for (i = 0; card->ctx->conf_blocks[i]; ++i) {
+		scconf_block **blocks = scconf_find_blocks(card->ctx->conf,
+			card->ctx->conf_blocks[i], "card_driver", "edo");
+		if (!blocks)
+			continue;
+		for (j = 0; blocks[j]; ++j) {
+			const char *permission = scconf_get_str(blocks[j],
+				"can_save_allowed", NULL);
+			save = scconf_get_str(blocks[j], "can_save", save);
+			if (permission) {
+				/* A later block cannot undo an applicable storage prohibition. */
+				if (!strcmp(permission, "no"))
+					*allowed = 0;
+				else if (strcmp(permission, "yes")) {
+					free(blocks);
+					return SC_ERROR_INVALID_ARGUMENTS;
+				}
+			}
+		}
+		free(blocks);
+	}
+	if (strcmp(save, "no") && strcmp(save, "ask"))
+		return SC_ERROR_INVALID_ARGUMENTS;
+	*ask = *allowed && !strcmp(save, "ask");
+	return SC_SUCCESS;
+}
+
+static int edo_load_available_can(sc_card_t *card,
+		int storage_allowed, char can[7])
 {
 	struct sc_establish_pace_channel_input configured;
+	int r;
+
+	sc_mem_clear(can, 7);
+	memset(&configured, 0, sizeof(configured));
+	r = edo_get_configured_can(card, &configured);
+	if (r == SC_SUCCESS &&
+			edo_can_valid(configured.pin, configured.pin_length)) {
+		memcpy(can, configured.pin, 6);
+		return SC_SUCCESS;
+	}
+	if (storage_allowed)
+		return edo_can_store_read(can);
+	return SC_ERROR_OBJECT_NOT_FOUND;
+}
+
+static int edo_prepare_can(sc_card_t *card, struct edo_private *priv)
+{
 	const char *mode = edo_can_prompt_mode(card);
+	char available[7] = {0};
 	int r;
 
 	if (strcmp(mode, "always") && strcmp(mode, "never")
@@ -154,31 +212,36 @@ static int edo_prepare_can(sc_card_t *card, struct edo_private *priv)
 		sc_log(card->ctx, "Invalid edo can_prompt setting.");
 		return SC_ERROR_INVALID_ARGUMENTS;
 	}
+	r = edo_can_storage_policy(card, &priv->save_ask,
+		&priv->storage_allowed);
+	if (r != SC_SUCCESS) {
+		sc_log(card->ctx, "Invalid edo CAN storage policy.");
+		return r;
+	}
 
-	/* Reuse a decision only within this card connection. */
+	/* A connection-local decision is independent of persistent storage. */
 	if (edo_can_valid((const unsigned char *)priv->can, 6))
 		return SC_SUCCESS;
 	sc_mem_clear(priv->can, sizeof(priv->can));
 	priv->entered = 0;
+	priv->save_offered = 0;
 
 	if (strcmp(mode, "always")) {
-		memset(&configured, 0, sizeof(configured));
-		r = edo_get_configured_can(card, &configured);
-		if (r == SC_SUCCESS &&
-				edo_can_valid(configured.pin, configured.pin_length)) {
+		r = edo_load_available_can(card, priv->storage_allowed, available);
+		if (r == SC_SUCCESS) {
 			if (!strcmp(mode, "never")) {
-				memcpy(priv->can, configured.pin, 6);
-				return SC_SUCCESS;
+				memcpy(priv->can, available, sizeof(priv->can));
+				goto done;
 			}
 			r = edo_pinentry_request(card,
 				"Czy użyć dostępnego CAN z dowodu osobistego?",
 				"Użyj zapisanego", "Wpisz inny", NULL);
 			if (r == SC_SUCCESS) {
-				memcpy(priv->can, configured.pin, 6);
-				return SC_SUCCESS;
+				memcpy(priv->can, available, sizeof(priv->can));
+				goto done;
 			}
 			if (r != SC_ERROR_NOT_ALLOWED)
-				return r;
+				goto done;
 		}
 	}
 
@@ -189,7 +252,36 @@ static int edo_prepare_can(sc_card_t *card, struct edo_private *priv)
 		"Dalej", NULL, priv->can);
 	if (r == SC_SUCCESS)
 		priv->entered = 1;
+
+done:
+	sc_mem_clear(available, sizeof(available));
 	return r;
+}
+
+/* Ask only after successful PACE; declining must not fail that connection. */
+static void edo_offer_can_save(sc_card_t *card, struct edo_private *priv)
+{
+	int r;
+
+	if (!priv->entered || !priv->save_ask || !priv->storage_allowed
+			|| priv->save_offered)
+		return;
+	priv->save_offered = 1;
+	r = edo_pinentry_request(card,
+		"CAN został poprawnie użyty do połączenia z dowodem. "
+		"Czy zapisać go dla tego konta użytkownika? "
+		"Wybierz Anuluj, aby użyć go tylko w bieżącym połączeniu.",
+		"Zapisz", NULL, NULL);
+	if (r != SC_SUCCESS)
+		return;
+	r = edo_can_store_write(priv->can);
+	if (r != SC_SUCCESS) {
+		sc_log(card->ctx, "Could not persist CAN.");
+		(void)edo_pinentry_request(card,
+			"Nie udało się zapisać CAN. "
+			"Będzie dostępny tylko w bieżącym połączeniu.",
+			"Dalej", NULL, NULL);
+	}
 }
 
 static int edo_pace_once(sc_card_t *card, const char can[7])
@@ -252,6 +344,7 @@ static int edo_unlock(sc_card_t *card)
 			"Połącz", NULL, priv->can);
 		if (r == SC_SUCCESS) {
 			priv->entered = 1;
+			priv->save_offered = 0;
 			r = sc_sm_stop(card);
 			if (r == SC_SUCCESS)
 				r = edo_pace_once(card, priv->can);
@@ -260,6 +353,8 @@ static int edo_unlock(sc_card_t *card)
 	if (r != SC_SUCCESS) {
 		sc_mem_clear(priv->can, sizeof(priv->can));
 		sc_log(card->ctx, "Error establishing PACE with CAN.");
+	} else {
+		edo_offer_can_save(card, priv);
 	}
 	LOG_FUNC_RETURN(card->ctx, r);
 }
