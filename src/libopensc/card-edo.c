@@ -82,7 +82,8 @@ edo_get_can(sc_card_t *card, struct sc_establish_pace_channel_input *pace_input)
 
 	can = getenv("EDO_CAN");
 
-	if (!can || can[0] != '\0') {
+	/* A nonempty environment value overrides the configured CAN. */
+	if (!can || can[0] == '\0') {
 		for (size_t i = 0; card->ctx->conf_blocks[i]; ++i) {
 			scconf_block** blocks = scconf_find_blocks(card->ctx->conf, card->ctx->conf_blocks[i], "card_driver", "edo");
 			if (!blocks)
