@@ -214,8 +214,22 @@ app default {
 		# To use these sources without a dialog, set can_prompt = never.
 		# can = 123456;
 		#
-		# An accepted CAN is kept only for the lifetime of the connection.
-		# This driver does not persist an interactively entered CAN.
+		# A CAN is kept in memory for the lifetime of the connection.
+		#
+		# Independent persistence policy:
+		# no  - do not offer to save an entered CAN (default)
+		# ask - after successful PACE, offer to save an entered CAN
+		# can_save = no;
+		#
+		# The private store is $HOME/.opensc-edo/can.
+		# Directory permissions: 0700; plaintext file permissions: 0600.
+		# Existing CAN sources are tried before this store.
+		# can_prompt = always does not use a saved CAN automatically.
+		#
+		# Disable reading and writing the private store:
+		# can_save_allowed = no;
+		# Default: yes. A "no" in an applicable edo block takes precedence.
+		# This does not disable the existing "can" and EDO_CAN sources.
 	}
 
 	card_driver eoi {
