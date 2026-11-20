@@ -247,11 +247,13 @@ static int edo_compute_signature(struct sc_card* card, const u8* data, size_t da
 	u8 padded_digest[48];
 	int r;
 
-	/* The edo driver currently supports secp384r1 only. */
-	if (!out)
-		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
-	if (outlen < 96)
-		LOG_FUNC_RETURN(card->ctx, SC_ERROR_BUFFER_TOO_SMALL);
+	/* MK returns raw bytes, so it bypasses the DER decoder validation. */
+	if (edo_is_mk(card)) {
+		if (!out)
+			LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
+		if (outlen < 96)
+			LOG_FUNC_RETURN(card->ctx, SC_ERROR_BUFFER_TOO_SMALL);
+	}
 
 	/* This card variant requires a full-width P-384 input.
 	 * Left zero padding preserves the ECDSA digest integer. */
@@ -264,12 +266,9 @@ static int edo_compute_signature(struct sc_card* card, const u8* data, size_t da
 		datalen = sizeof padded_digest;
 	}
 
-	/* The returned length delimits DER data on the legacy path. */
 	r = sc_get_iso7816_driver()->ops->compute_signature(
-		card, data, datalen, sig, sizeof sig);
+			card, data, datalen, sig, sizeof sig);
 	LOG_TEST_RET(card->ctx, r, "Internal signature failed");
-	if ((size_t)r > sizeof sig)
-		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_DATA);
 
 	/* This ATR variant returns fixed-width r || s; legacy cards return DER. */
 	if (edo_is_mk(card)) {
@@ -279,9 +278,9 @@ static int edo_compute_signature(struct sc_card* card, const u8* data, size_t da
 		LOG_FUNC_RETURN(card->ctx, 96);
 	}
 
+	/* The edo driver currently supports secp384r1 only. */
 	r = sc_asn1_decode_ecdsa_signature(
-		card->ctx, sig, (size_t)r, 48, &out, outlen);
-	LOG_TEST_RET(card->ctx, r, "ASN.1 conversion failed");
+			card->ctx, sig, (size_t)r, 48, &out, outlen);
 	LOG_FUNC_RETURN(card->ctx, r);
 }
 
